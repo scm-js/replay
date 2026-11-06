@@ -38,5 +38,7 @@ jobs:
             exit 1
           fi
       # Authentication comes from the OIDC token, so no NODE_AUTH_TOKEN, and
-      # provenance is generated automatically without --provenance.
-      - run: npm publish
+      # provenance is generated automatically without --provenance. The trusted
+      # publisher may only stage a release (npm stage, npm >= 11.15): it waits
+      # under Staged Packages on npmjs.com until a maintainer approves it there.
+      - run: npm stage publish

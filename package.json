@@ -1,6 +1,6 @@
 {
   "name": "@scm-js/replay",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Read StarCraft: Brood War replays (.rep), from 1.16 to Remastered, in Node.js and the browser: header, players, every command, and the map",
   "keywords": ["starcraft", "brood war", "remastered", "replay", "rep", "screp", "bwapi", "parser"],
   "homepage": "https://github.com/scm-js/replay#readme",
