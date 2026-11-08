@@ -53,7 +53,12 @@ as Korean (CP949) when it reads as Korean, else as Western (Windows-1252), which
 for the replays people actually have. `cString` is that rule on its own.
 
 `detectFormat(bytes)` says whether bytes are a replay without reading them, and
-`readCommands` reads a command section by itself.
+`readCommands(section, format)` reads a command section by itself.
+
+A 1.16.1 replay of a mod may carry the mod's own command types: a plugin can send commands
+under ids the game itself does not use, such as 0x60 to 0x65, which only Remastered 1.21
+gives a meaning. The reader counts them in `unknownCommands` and leaves out the rest of
+their frame, so the analysis of a mod's replay sees only the game's own commands.
 
 A frame is `FRAME_MS` (42) milliseconds at Fastest.
 

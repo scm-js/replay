@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-11-08
+
+### Fixed
+- In a 1.16.1 replay, command types 0x60 to 0x65 are a mod's own (Remastered added them
+  in 1.21) and count as unknown instead of being read as Remastered's selects and clicks;
+  `readCommands` takes the replay's format.
+
 ## [1.1.0] - 2026-11-08
 
 ### Added

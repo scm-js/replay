@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { appendModTag, cString, detectFormat, isModTag, MOD_TAG_MAX, parseReplay, readModTag, REPLAY_ERRORS, ReplayError, stripModTag, type ModTag, type ReplayFormat } from "../src/index";
+import { appendModTag, cString, detectFormat, isModTag, MOD_TAG_MAX, parseReplay, readCommands, readModTag, REPLAY_ERRORS, ReplayError, stripModTag, type ModTag, type ReplayFormat } from "../src/index";
 import { chk, cmds, le16, writeReplay } from "../src/write";
 
 const players = [
@@ -111,6 +111,45 @@ describe("Remastered extras", () => {
     const r = await parseReplay(writeReplay({ format: "1.18", players, commands, chk: chk(64, 64) }));
     expect(r.unknownCommands).toBe(1);
     expect(r.commands.map((c) => c.kind)).toEqual(["train"]);
+  });
+});
+
+/** A command stream from raw frame blocks: `[frame, the block's bytes as hex]`, several commands to a block. */
+function blocks(list: [frame: number, hex: string][]): Uint8Array {
+  const out: number[] = [];
+  for (const [frame, hex] of list) {
+    const body = hex.match(/../g)!.map((b) => parseInt(b, 16));
+    out.push(frame & 255, (frame >> 8) & 255, (frame >> 16) & 255, frame >>> 24, body.length, ...body);
+  }
+  return new Uint8Array(out);
+}
+
+describe("a mod's own commands", () => {
+  // The command stream of a Cosmonarchy BW replay saved by the play page: its plugin sends type 0x63 with a body of
+  // its own every game. Then one ordinary block: a select and a right click.
+  const vanilla = [0x00, 0x09, 1, ...le16(5), 0x00, 0x14, ...le16(640), ...le16(320), ...le16(0), ...le16(228), 0];
+  const commands = blocks([
+    [2, "00630401ffffffffffffffffff00630201400c00000000000000"],
+    [3, "006306ab519d83a309ee848978006306ab519d83a309ee848978006306ab519d83a309ee848978"],
+    [5, "00630201400d5d000000000000"],
+    [10, vanilla.map((b) => b.toString(16).padStart(2, "0")).join("")],
+  ]);
+
+  it("are unknown in a 1.16.1 replay, where 0x60–0x65 are not Remastered's", async () => {
+    const r = await parseReplay(writeReplay({ format: "legacy", players, commands, chk: chk(64, 64) }));
+    expect(r.unknownCommands).toBe(3);
+    expect(r.commands.filter((c) => c.frame < 10)).toEqual([]);
+    expect(r.commands.map((c) => [c.frame, c.kind])).toEqual([[10, "select"], [10, "rightClick"]]);
+    expect(r.commands[0].tags).toEqual([5]);
+    expect(r.commands[1]).toMatchObject({ x: 640, y: 320, unit: 228, queued: false });
+  });
+
+  it("read as Remastered's 1.21 commands in a 1.21 replay, and when no format is given", async () => {
+    const r = await parseReplay(writeReplay({ format: "1.21", players, commands, chk: chk(64, 64) }));
+    expect(r.commands[0]).toMatchObject({ frame: 2, kind: "select", type: 0x63 });
+    expect(r.commands.slice(-2).map((c) => [c.frame, c.kind])).toEqual([[10, "select"], [10, "rightClick"]]);
+    expect(readCommands(commands).commands[0]).toMatchObject({ frame: 2, kind: "select", type: 0x63 });
+    expect(readCommands(commands, "legacy").unknown).toBe(3);
   });
 });
 
