@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { cString, detectFormat, parseReplay, REPLAY_ERRORS, ReplayError, type ReplayFormat } from "../src/index";
+import { appendModTag, cString, detectFormat, isModTag, MOD_TAG_MAX, parseReplay, readModTag, REPLAY_ERRORS, ReplayError, stripModTag, type ModTag, type ReplayFormat } from "../src/index";
 import { chk, cmds, le16, writeReplay } from "../src/write";
 
 const players = [
@@ -136,6 +136,178 @@ describe("text from before Remastered", () => {
   });
 });
 
+const mod: ModTag = {
+  v: 1,
+  dataSet: { hash: "0123456789abcdef", name: "Test Mod", url: "https://example.org/test-mod" },
+  plugins: [{ name: "first.qdp", sha256: "a".repeat(64) }, { name: "second.qdp", sha256: "b".repeat(64) }],
+  firegraft: { name: "Test Mod.fgp", sha256: "c".repeat(64) },
+  noplugins: false,
+  engine: { lifter: "m7s6.1", build: "d".repeat(16) },
+  madeBy: "test 1.0.0",
+};
+
+/** A tagged section by hand: the id, the length, then `body`. */
+function tagged(id: string, body: Uint8Array): Uint8Array {
+  const out = new Uint8Array(8 + body.length);
+  out.set(new TextEncoder().encode(id));
+  new DataView(out.buffer).setUint32(4, body.length, true);
+  out.set(body, 8);
+  return out;
+}
+
+const concat = (...parts: Uint8Array[]) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+};
+
+/** A raw section holding `data`, as `appendModTag` writes them (checksum not checked by the reader). */
+const raw = (data: Uint8Array) => {
+  const head = new Uint8Array(12);
+  const dv = new DataView(head.buffer);
+  dv.setUint32(4, 1, true);
+  dv.setUint32(8, data.length, true);
+  return concat(head, data);
+};
+const le32 = (n: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+/** An SCMJ section around `json`, as the format frames it. */
+const scmj = (json: string) => { const p = new TextEncoder().encode(json); return tagged("SCMJ", concat(raw(le32(p.length)), raw(p))); };
+
+describe.each<ReplayFormat>(["legacy", "1.18", "1.21"])("a mod tag in a %s replay", (format) => {
+  const plain = writeReplay({ format, players, commands: classic, chk: chk(64, 64, 4), cclr: format === "legacy" ? undefined : { 1: [1, 0.5, 0] } });
+
+  it("is null when there is none", async () => {
+    expect((await parseReplay(plain)).mod).toBeNull();
+    expect(await readModTag(plain)).toBeNull();
+    expect(await stripModTag(plain)).toBe(plain);
+  });
+
+  it("is written, read back, and changes nothing else", async () => {
+    const bytes = await appendModTag(plain, mod);
+    expect(detectFormat(bytes)).toBe(format);
+    const before = await parseReplay(plain);
+    const after = await parseReplay(bytes);
+    expect(after.mod).toEqual(mod);
+    expect({ ...after, mod: null }).toEqual(before);
+    expect(await readModTag(bytes)).toEqual(mod);
+    // The bytes before the section are the file's own; nothing after.
+    expect(bytes.subarray(0, plain.length)).toEqual(plain);
+    expect(String.fromCharCode(...bytes.subarray(plain.length, plain.length + 4))).toBe("SCMJ");
+  });
+
+  it("replaces the tag a file has, and strips it back to the file it was", async () => {
+    const once = await appendModTag(plain, mod);
+    const other = { ...mod, dataSet: { ...mod.dataSet, hash: "fedcba9876543210" } };
+    const twice = await appendModTag(once, other);
+    expect(twice.length).toBe(once.length);
+    expect((await parseReplay(twice)).mod).toEqual(other);
+    expect(await stripModTag(twice)).toEqual(plain);
+  });
+
+  it("is read when the test writer packs it the format's way", async () => {
+    const bytes = writeReplay({ format, players, commands: classic, chk: chk(64, 64, 4), mod });
+    expect((await parseReplay(bytes)).mod).toEqual(mod);
+    expect(await stripModTag(bytes)).toEqual(writeReplay({ format, players, commands: classic, chk: chk(64, 64, 4) }));
+  });
+
+  it("keeps fields it does not know", async () => {
+    const later = { ...mod, v: 2, seed: 42, dataSet: { ...mod.dataSet, files: 37 } } as ModTag;
+    expect((await parseReplay(await appendModTag(plain, later))).mod).toEqual(later);
+  });
+
+  it("is ignored, and the rest read, when it is damaged", async () => {
+    const before = await parseReplay(plain);
+    const good = JSON.stringify(mod);
+    const damaged = [
+      scmj(good.slice(0, -5)),                                         // cut short
+      scmj("not JSON"),
+      scmj(JSON.stringify({ ...mod, dataSet: { ...mod.dataSet, hash: "short" } })),
+      scmj(JSON.stringify({ ...mod, plugins: [{ name: "x" }] })),
+      scmj(JSON.stringify({ ...mod, noplugins: "no" })),
+      scmj(JSON.stringify([mod])),
+      tagged("SCMJ", raw(le32(5000))),                                 // a size and no payload
+      tagged("SCMJ", new Uint8Array([1, 2, 3])),
+      concat(new TextEncoder().encode("SCMJ"), le32(0xffff)),          // longer than the file
+      new Uint8Array([0xff, 0xfe]),                                     // a byte string, not a section
+    ];
+    for (const tail of damaged) {
+      const r = await parseReplay(concat(plain, tail));
+      expect(r.mod).toBeNull();
+      expect({ ...r, mod: null }).toEqual(before);
+      expect(await readModTag(concat(plain, tail))).toBeNull();
+    }
+  });
+
+  it("is found after a damaged one, and past sections it does not know", async () => {
+    const bytes = concat(plain, tagged("Zzzz", new Uint8Array([9, 9])), scmj("{}"), scmj(JSON.stringify(mod)));
+    expect((await parseReplay(bytes)).mod).toEqual(mod);
+  });
+
+  it("is refused when too long to write, or not of the shape", async () => {
+    const long = { ...mod, plugins: Array.from({ length: 60 }, (_, i) => ({ name: `p${i}.qdp`, sha256: "e".repeat(64) })) };
+    await expect(appendModTag(plain, long)).rejects.toBeInstanceOf(RangeError);
+    await expect(appendModTag(plain, { ...mod, madeBy: 1 } as unknown as ModTag)).rejects.toBeInstanceOf(TypeError);
+    await expect(appendModTag(new Uint8Array(100), mod)).rejects.toBeInstanceOf(ReplayError);
+  });
+});
+
+describe("a mod tag in the wrong place", () => {
+  it("is not found inside another section's data", async () => {
+    // A chat line reading SCMJ and a whole section's bytes in the map: neither is a tagged section.
+    const section = scmj(JSON.stringify(mod));
+    const commands = cmds([[5, 0, 0x5c, 0, ...section.subarray(0, 79), 0]]);
+    const map = concat(chk(64, 64), section);
+    for (const format of ["legacy", "1.21"] as const) {
+      const bytes = writeReplay({ format, players, commands, chk: map });
+      expect((await parseReplay(bytes)).mod).toBeNull();
+      expect(await readModTag(bytes)).toBeNull();
+    }
+  });
+
+  it("is ignored where a Remastered file keeps its names, and the names are not read from it", async () => {
+    const bytes = writeReplay({ format: "1.21", players, commands: cmds([]), chk: chk(64, 64) });
+    // The writer ends a 1.21 file with the names section, then an Sbat section of 3 bytes (11 in all): find where the names start.
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const namesEnd = bytes.length - 11;
+    let mapEnd = namesEnd - 12;
+    while (mapEnd > 0 && !(dv.getUint32(mapEnd + 4, true) === 1 && mapEnd + 12 + dv.getUint32(mapEnd + 8, true) === namesEnd)) mapEnd--;
+    const moved = concat(bytes.subarray(0, mapEnd), scmj(JSON.stringify(mod)));
+    const r = await parseReplay(moved);
+    expect(r.mod).toBeNull();
+    expect(r.players.map((p) => p.name)).toEqual(["Alpha", "Beta"]);
+    // Writing a tag gives such a file an empty names section first, so the tag is where it is read.
+    const fixed = await parseReplay(await appendModTag(moved, mod));
+    expect(fixed.mod).toEqual(mod);
+    expect(fixed.players.map((p) => p.name)).toEqual(["Alpha", "Beta"]);
+  });
+});
+
+describe("errors", () => {
+  it("every ReplayError message is in REPLAY_ERRORS, and every one is distinct", () => {
+    expect(new Set(REPLAY_ERRORS).size).toBe(REPLAY_ERRORS.length);
+    const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    const thrown = [...source.matchAll(/msg\("([^"]+)"\)/g)].map((m) => m[1]);
+    expect(thrown.length).toBeGreaterThan(0);
+    for (const m of thrown) expect(REPLAY_ERRORS).toContain(m);
+    // ReplayError is never made with a message that does not go through msg().
+    expect(source.match(/new ReplayError\((?!msg\()/g)).toBeNull();
+  });
+
+  it("isModTag checks every field", () => {
+    expect(isModTag(mod)).toBe(true);
+    expect(isModTag({ ...mod, firegraft: null, engine: null, plugins: [], dataSet: { ...mod.dataSet, url: null } })).toBe(true);
+    for (const k of Object.keys(mod)) {
+      const { [k]: _, ...rest } = mod;
+      void _;
+      expect(isModTag(rest)).toBe(false);
+    }
+    expect(isModTag({ ...mod, dataSet: { ...mod.dataSet, hash: "0123456789ABCDEF" } })).toBe(false);
+    expect(isModTag({ ...mod, v: 1.5 })).toBe(false);
+    expect(new TextEncoder().encode(JSON.stringify(mod)).length).toBeLessThan(MOD_TAG_MAX);
+  });
+});
+
 // Real replays, when there are some in fixtures/ (gitignored: nobody's games are committed).
 const dir = new URL("../fixtures/", import.meta.url);
 const reps = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".rep")) : [];
@@ -147,6 +319,20 @@ if (reps.length) {
       expect(r.players.length).toBeGreaterThan(0);
       const [w, h] = dims(r.chk);
       expect(w * h).toBeGreaterThan(0);
+      expect(r.mod).toBeNull();
+    });
+
+    it.each(reps)("%s takes a mod tag and gives it back, the rest read as before", async (name) => {
+      const bytes = new Uint8Array(readFileSync(new URL(name, dir)));
+      const before = await parseReplay(bytes);
+      const tagged = await appendModTag(bytes, mod);
+      const after = await parseReplay(tagged);
+      expect(after.mod).toEqual(mod);
+      expect({ ...after, mod: null }).toEqual(before);
+      expect(await readModTag(tagged)).toEqual(mod);
+      expect(await stripModTag(tagged)).toEqual(bytes);
+      // The file's own bytes come first, untouched: the tag goes at the end of what the game wrote.
+      expect(tagged.subarray(0, bytes.length)).toEqual(bytes);
     });
   });
 }

@@ -23,6 +23,12 @@
  * The commands and map sections are variable in size: each is preceded by a four-byte
  * section of its own holding the size.
  *
+ * A tagged section is the four-character id, the length in bytes of what follows, then
+ * framed sections. scmJS adds one of its own, `SCMJ`, which says which mod a game was
+ * played with (`ModTag`): a four-byte section holding the size, then the size's bytes of
+ * UTF-8 JSON. It may follow the map section of a legacy file directly, as 1.16's own
+ * loader reads nothing past the map.
+ *
  * The layout follows screp (github.com/icza/screp, Apache-2.0), the reference replay
  * parser, which in turn follows BWHF and bwreplib.
  */
@@ -104,7 +110,45 @@ export interface Replay {
   unknownCommands: number;
   /** The map the game was played on, as a bare `scenario.chk`. */
   chk: Uint8Array;
+  /** The mod the game was played with, from the replay's `SCMJ` section; null for a game of the unmodified game. */
+  mod: ModTag | null;
 }
+
+/** A file that ran in the game, by name and the SHA-256 of its bytes (64 lowercase hex digits). */
+export interface ModFile {
+  name: string;
+  sha256: string;
+  [key: string]: unknown;
+}
+
+/**
+ * What a replay's `SCMJ` section says about the mod a game was played with. Fields this
+ * version does not know are kept as they were read.
+ */
+export interface ModTag {
+  /** The format's version: 1. */
+  v: number;
+  /**
+   * The data set: the files that differ from the game's own. `hash` is 16 lowercase hex
+   * digits, the first of the SHA-256 over the sorted `name\tsha256` lines of those files;
+   * `url` the makers' page, or null.
+   */
+  dataSet: { hash: string; name: string; url: string | null; [key: string]: unknown };
+  /** The plugins that ran, in the order they were loaded; empty for none. */
+  plugins: ModFile[];
+  /** The FireGraft patch that was applied, if one was. */
+  firegraft: ModFile | null;
+  /** True when the game was played without the mod's plugins. */
+  noplugins: boolean;
+  /** The engine that played the game: the lifter's version and the build's hash, or null when not known. */
+  engine: { lifter: string; build: string; [key: string]: unknown } | null;
+  /** The program that wrote the section, such as `scm-sim 0.16.0`. */
+  madeBy: string;
+  [key: string]: unknown;
+}
+
+/** The largest `SCMJ` payload `appendModTag` writes, in bytes of JSON. */
+export const MOD_TAG_MAX = 4096;
 
 /** A reason the file cannot be read: its message is one of `REPLAY_ERRORS`, in English. */
 export class ReplayError extends Error {}
@@ -398,6 +442,37 @@ export function readCommands(d: Uint8Array): { commands: Command[]; unknown: num
   return { commands, unknown };
 }
 
+/* ── Mod identity ───────────────────────────────────────── */
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const isFile = (v: unknown): v is ModFile => isObject(v) && typeof v.name === "string" && typeof v.sha256 === "string" && /^[0-9a-f]{64}$/.test(v.sha256);
+
+/** Whether `value` has the shape of a `ModTag`: every field present and of its type. */
+export function isModTag(value: unknown): value is ModTag {
+  if (!isObject(value)) return false;
+  const { v, dataSet, plugins, firegraft, noplugins, engine, madeBy } = value;
+  return typeof v === "number" && Number.isInteger(v) && v >= 1
+    && isObject(dataSet) && typeof dataSet.hash === "string" && /^[0-9a-f]{16}$/.test(dataSet.hash)
+    && typeof dataSet.name === "string" && (dataSet.url === null || typeof dataSet.url === "string")
+    && Array.isArray(plugins) && plugins.every(isFile)
+    && (firegraft === null || isFile(firegraft))
+    && typeof noplugins === "boolean"
+    && (engine === null || (isObject(engine) && typeof engine.lifter === "string" && typeof engine.build === "string"))
+    && typeof madeBy === "string";
+}
+
+/** An `SCMJ` section's bytes after the length: the payload's size, then the payload. Damage of any kind reads as null. */
+async function readModBody(body: Uint8Array, format: ReplayFormat, unzip: Inflate): Promise<ModTag | null> {
+  try {
+    const payload = await sized(new Reader(body), format, unzip);
+    if (payload.length > 0x10000) return null;
+    const value: unknown = JSON.parse(utf8Strict.decode(payload));
+    return isModTag(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 /* ── The whole file ─────────────────────────────────────── */
 
 const tag = (s: string) => (s.charCodeAt(0) | (s.charCodeAt(1) << 8) | (s.charCodeAt(2) << 16) | (s.charCodeAt(3) << 24)) >>> 0;
@@ -405,6 +480,149 @@ const tag = (s: string) => (s.charCodeAt(0) | (s.charCodeAt(1) << 8) | (s.charCo
 const TAGGED: Record<number, number> = {
   [tag("SKIN")]: 0x15e0, [tag("LMTS")]: 0x1c, [tag("BFIX")]: 0x08, [tag("CCLR")]: 0xc0, [tag("GCFG")]: 0x19,
 };
+const SCMJ = tag("SCMJ");
+
+const u32At = (b: Uint8Array, at: number) => (b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)) >>> 0;
+
+interface Tagged {
+  kind: number;
+  /** Where the tag's id is. */
+  start: number;
+  /** Where the section's data starts and ends: after the id and length, and that length on. */
+  body: number;
+  end: number;
+}
+
+/** The tagged sections from `r`'s position, as far as they are whole; `r` is left after the last. */
+function taggedRun(r: Reader): Tagged[] {
+  const out: Tagged[] = [];
+  while (r.left >= 8) {
+    const start = r.pos;
+    const kind = r.u32();
+    const raw = r.u32();
+    if (raw > r.left) { r.pos = start; break; }
+    out.push({ kind, start, body: r.pos, end: r.pos + raw });
+    r.pos += raw;
+  }
+  return out;
+}
+
+/** Where the four classic sections, the names and the tagged sections of a file lie. */
+interface Layout {
+  format: ReplayFormat;
+  /** The end of the map section. */
+  mapEnd: number;
+  /** The start of the tagged run: the end of the names section (Remastered) or of the map (legacy); -1 when a Remastered file has no names section that reads. */
+  runStart: number;
+  tagged: Tagged[];
+  /** Where the whole tagged sections end; anything after is not read. */
+  runEnd: number;
+}
+
+/** A tagged section's id at `r`'s position, where Remastered keeps its player names: a section in the wrong place. */
+const tagHere = (r: Reader) => r.left >= 4 && (u32At(r.b, r.pos) === SCMJ || u32At(r.b, r.pos) in TAGGED);
+
+async function layout(bytes: Uint8Array, unzip: Inflate): Promise<Layout> {
+  const format = detectFormat(bytes);
+  if (!format) throw new ReplayError(msg("This is not a StarCraft replay."));
+  const r = new Reader(bytes);
+  await section(r, 4, format, unzip);
+  if (format === "1.21") r.u32();
+  await section(r, 0x279, format, unzip);
+  await sized(r, format, unzip);
+  await sized(r, format, unzip);
+  const mapEnd = r.pos;
+  let runStart = mapEnd;
+  if (format !== "legacy") {
+    runStart = -1;
+    if (r.left > 0 && !tagHere(r)) {
+      try { await section(r, 0x300, format, unzip); runStart = r.pos; } catch { r.pos = mapEnd; }
+    }
+  }
+  const tagged = runStart < 0 ? [] : taggedRun(r);
+  return { format, mapEnd, runStart, tagged, runEnd: runStart < 0 ? mapEnd : r.pos };
+}
+
+function join(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+}
+
+const le32 = (n: number) => new Uint8Array([n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]);
+
+let crcTable: Uint32Array | undefined;
+/** A section's checksum as the game writes it: CRC-32 from 0xFFFFFFFF, without the final inversion. */
+function checksum(b: Uint8Array): number {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c >>> 0;
+    }
+  }
+  let c = 0xffffffff;
+  for (let i = 0; i < b.length; i++) c = crcTable[(c ^ b[i]) & 0xff] ^ (c >>> 8);
+  return c >>> 0;
+}
+
+/** A section of one chunk stored as is, which every version reads: a chunk as long as its data is not packed. */
+const rawSection = (data: Uint8Array) => join([le32(checksum(data)), le32(1), le32(data.length), data]);
+
+/** The whole `SCMJ` section: id, length, then the payload's size and the payload, each a raw section. */
+function modSection(mod: ModTag): Uint8Array {
+  if (!isModTag(mod)) throw new TypeError("The mod tag is missing a field, or has one of the wrong type.");
+  const payload = new TextEncoder().encode(JSON.stringify(mod));
+  if (payload.length > MOD_TAG_MAX) throw new RangeError(`The mod tag is ${payload.length} bytes of JSON; the most is ${MOD_TAG_MAX}.`);
+  const body = join([rawSection(le32(payload.length)), rawSection(payload)]);
+  return join([le32(SCMJ), le32(body.length), body]);
+}
+
+/** The replay's `SCMJ` section, or null when it has none or the one it has is damaged. */
+export async function readModTag(bytes: Uint8Array, unzip: Inflate = inflate): Promise<ModTag | null> {
+  let l: Layout;
+  try { l = await layout(bytes, unzip); } catch { return null; }
+  for (const t of l.tagged) {
+    if (t.kind !== SCMJ) continue;
+    const mod = await readModBody(bytes.subarray(t.body, t.end), l.format, unzip);
+    if (mod) return mod;
+  }
+  return null;
+}
+
+/** The replay without its `SCMJ` sections; the same array when it has none. Rejects with a `ReplayError` when the file is not a replay. */
+export async function stripModTag(bytes: Uint8Array, unzip: Inflate = inflate): Promise<Uint8Array> {
+  const l = await layout(bytes, unzip);
+  const ours = l.tagged.filter((t) => t.kind === SCMJ);
+  if (!ours.length) return bytes;
+  const parts: Uint8Array[] = [];
+  let at = 0;
+  for (const t of ours) { parts.push(bytes.subarray(at, t.start)); at = t.end; }
+  parts.push(bytes.subarray(at));
+  return join(parts);
+}
+
+/**
+ * The replay with `mod` as its `SCMJ` section, in place of any it had: at the end of the
+ * tagged sections, which is the end of the file for any replay the game wrote. Rejects with
+ * a `ReplayError` when the file is not a replay, a `TypeError` when `mod` is not a `ModTag`
+ * and a `RangeError` when its JSON is longer than `MOD_TAG_MAX`. The section is not packed,
+ * so this needs no compressor and runs in a browser.
+ */
+export async function appendModTag(bytes: Uint8Array, mod: ModTag, unzip: Inflate = inflate): Promise<Uint8Array> {
+  const ours = modSection(mod);
+  const l = await layout(bytes, unzip);
+  if (l.runStart < 0) {
+    // A Remastered file without its names section: an empty one first (no names: the header's stay), so the tag is where a reader looks.
+    return join([bytes.subarray(0, l.mapEnd), rawSection(new Uint8Array(0x300)), ours, bytes.subarray(l.mapEnd)]);
+  }
+  const parts: Uint8Array[] = [bytes.subarray(0, l.runStart)];
+  for (const t of l.tagged) if (t.kind !== SCMJ) parts.push(bytes.subarray(t.start, t.end));
+  parts.push(ours, bytes.subarray(l.runEnd));
+  return join(parts);
+}
 
 export async function parseReplay(bytes: Uint8Array, unzip: Inflate = inflate): Promise<Replay> {
   const format = detectFormat(bytes);
@@ -418,9 +636,12 @@ export async function parseReplay(bytes: Uint8Array, unzip: Inflate = inflate): 
   const chk = await sized(r, format, unzip);
   void id;
 
-  if (format !== "legacy") {
-    // Remastered: the full-length player names, then tagged sections. A damaged or
-    // unfamiliar tail costs only what it would have added.
+  // Remastered: the full-length player names, then tagged sections; a legacy file may have
+  // tagged sections straight after the map. A damaged or unfamiliar tail costs only what it
+  // would have added.
+  let mod: ModTag | null = null;
+  let run = format === "legacy";
+  if (!run && !tagHere(r)) {
     try {
       const names = await section(r, 0x300, format, unzip);
       slots.forEach((s, i) => {
@@ -428,23 +649,23 @@ export async function parseReplay(bytes: Uint8Array, unzip: Inflate = inflate): 
         const name = cString(names.subarray(i * 96, (i + 1) * 96));
         if (name) s.name = name;
       });
-      while (r.left >= 8) {
-        const kind = r.u32();
-        const raw = r.u32();
-        const start = r.pos;
-        const size = TAGGED[kind];
-        if (size && kind === tag("CCLR")) {
-          const colors = await section(r, size, format, unzip);
-          const dv = new DataView(colors.buffer, colors.byteOffset, colors.byteLength);
-          slots.forEach((s, i) => {
-            if ((i + 1) * 16 > colors.length) return;
-            const c = [0, 4, 8].map((o) => Math.round(Math.min(1, Math.max(0, dv.getFloat32(i * 16 + o, true))) * 255));
-            if (dv.getFloat32(i * 16 + 12, true) > 0) s.color = hex((c[0] << 16) | (c[1] << 8) | c[2]);
-          });
-        }
-        r.pos = start + raw;
-      }
+      run = true;
     } catch { /* optional sections */ }
+  }
+  for (const t of run ? taggedRun(r) : []) {
+    if (t.kind === tag("CCLR") && format !== "legacy") {
+      try {
+        const colors = await section(new Reader(bytes.subarray(t.body, t.end)), TAGGED[t.kind], format, unzip);
+        const dv = new DataView(colors.buffer, colors.byteOffset, colors.byteLength);
+        slots.forEach((s, i) => {
+          if ((i + 1) * 16 > colors.length) return;
+          const c = [0, 4, 8].map((o) => Math.round(Math.min(1, Math.max(0, dv.getFloat32(i * 16 + o, true))) * 255));
+          if (dv.getFloat32(i * 16 + 12, true) > 0) s.color = hex((c[0] << 16) | (c[1] << 8) | c[2]);
+        });
+      } catch { /* optional sections */ }
+    } else if (t.kind === SCMJ && !mod) {
+      mod = await readModBody(bytes.subarray(t.body, t.end), format, unzip);
+    }
   }
 
   const players = slots.filter((s) => s.name !== "" && s.type !== 0);
@@ -454,5 +675,5 @@ export async function parseReplay(bytes: Uint8Array, unzip: Inflate = inflate): 
     players[1].team = 2;
   }
   if (header.gameType === 3) players.forEach((p, i) => { p.team = i + 1; });
-  return { format, header, players, commands, unknownCommands: unknown, chk };
+  return { format, header, players, commands, unknownCommands: unknown, chk, mod };
 }

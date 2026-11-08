@@ -46,6 +46,7 @@ translated.
 | `commands` | Every command with its frame and player, by kind (`select`, `rightClick`, `targeted`, `build`, `train`, `morph`, `upgrade`, `tech`, `hotkey`, `chat`, `leave`, …) and the game's own type byte, with positions, units, orders and selected unit tags where the command has them |
 | `unknownCommands` | Commands whose type the reader does not know (the rest of their frame is skipped) |
 | `chk` | The map as a bare `scenario.chk` |
+| `mod` | The mod the game was played with, from an `SCMJ` section (see [Mod identity](#mod-identity)), or `null` |
 
 Text in replays from before Remastered has no fixed encoding. It is read as UTF-8, else
 as Korean (CP949) when it reads as Korean, else as Western (Windows-1252), which is right
@@ -55,6 +56,74 @@ for the replays people actually have. `cString` is that rule on its own.
 `readCommands` reads a command section by itself.
 
 A frame is `FRAME_MS` (42) milliseconds at Fastest.
+
+## Mod identity
+
+A replay records commands, not the files the game read, so a replay of a modded game
+plays back wrong (or not at all) with other files. scmJS's tools add a section that says
+which mod a game was played with, so a viewer can find that mod, or refuse to play the
+replay with a different version of it.
+
+```ts
+import { appendModTag, readModTag, stripModTag } from "@scm-js/replay";
+
+const tagged = await appendModTag(bytes, {
+  v: 1,
+  dataSet: { hash: "1f2e3d4c5b6a7980", name: "My Mod", url: "https://example.org/my-mod" },
+  plugins: [{ name: "plugin.qdp", sha256: "…64 hex digits…" }],
+  firegraft: null,
+  noplugins: false,
+  engine: null,
+  madeBy: "my-tool 1.0.0",
+});
+(await parseReplay(tagged)).mod;   // the same object
+await readModTag(tagged);          // the same, without reading the rest
+await stripModTag(tagged);         // the file as it was
+```
+
+`appendModTag` replaces a section the file already has, and rejects when the file is not a
+replay (`ReplayError`), the object lacks a field or has one of the wrong type
+(`TypeError`), or its JSON is longer than `MOD_TAG_MAX` (4,096) bytes (`RangeError`).
+`isModTag` is the shape check on its own. A damaged section reads as `null`, never as an
+error: the rest of the replay reads as before.
+
+### The section
+
+A tagged section, as Remastered writes its own (`LMTS`, `CCLR`, …): the four bytes `SCMJ`,
+a 32-bit little-endian length of what follows, then two framed sections, as the commands
+and the map are framed: a four-byte section holding the payload's size, then the payload.
+`appendModTag` writes each as one chunk stored as is (a chunk as long as its data is not
+packed), so it needs no compressor; a reader takes a packed chunk too. The checksums are the
+game's (CRC-32 from `0xFFFFFFFF`, without the final inversion); this reader does not check
+them.
+
+Where it goes:
+
+- Remastered (1.18 and later): among the tagged sections after the player names, written
+  last.
+- Legacy (1.16 and before): straight after the map section, which is where a 1.16 file
+  ends. 1.16.1's own replay loader reads the four sections and nothing after them, so the
+  game plays a tagged replay exactly as the same file without the section.
+
+Readers before 1.1.0 step over it in Remastered files, as over any section they do not
+know, and do not read past the map in legacy ones.
+
+### The payload
+
+UTF-8 JSON, one object:
+
+| Field | |
+| --- | --- |
+| `v` | The format's version, `1` |
+| `dataSet` | `{ hash, name, url }`: the files the mod changes. `hash` is 16 lowercase hex digits: the first 16 of the SHA-256 over the changed files' `name<TAB>sha256` lines, sorted, joined by newlines. `url` is the makers' page, or `null` |
+| `plugins` | `[{ name, sha256 }]`: the code that ran, in the order it was loaded; `[]` for none |
+| `firegraft` | `{ name, sha256 }` of the FireGraft patch applied, or `null` |
+| `noplugins` | `true` when the game was played without the mod's plugins |
+| `engine` | `{ lifter, build }`: the engine that played the game, or `null` |
+| `madeBy` | The program that wrote the section, such as `scm-sim 0.16.0` |
+
+Every `sha256` is 64 lowercase hex digits. Fields a reader does not know are kept in what it
+returns, so a later version can add some.
 
 ## Writing replays for tests
 
@@ -73,6 +142,8 @@ const bytes = writeReplay({
   chk: chk(64, 64),
 });
 ```
+
+`mod` adds an `SCMJ` section, packed the format's way.
 
 ## Credits
 

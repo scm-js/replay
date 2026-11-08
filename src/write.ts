@@ -1,12 +1,13 @@
 /**
  * `@scm-js/replay/write`: a replay writer for tests. It builds a file in any of the three
- * formats from a header, a command stream and a map, so code that reads replays can be
- * tested without shipping anyone's games. Node only (it packs with `node:zlib`). The games
- * it writes are not playable: the commands are whatever the test gives.
+ * formats from a header, a command stream and a map, and a mod's `SCMJ` section when asked,
+ * so code that reads replays can be tested without shipping anyone's games. Node only (it
+ * packs with `node:zlib`). The games it writes are not playable: the commands are whatever
+ * the test gives.
  */
 import { deflateSync } from "node:zlib";
 import { implode } from "mopaq";
-import type { ReplayFormat } from "./index";
+import type { ModTag, ReplayFormat } from "./index";
 
 export interface TestPlayer {
   index: number;
@@ -30,6 +31,8 @@ export interface TestReplay {
   /** Remastered only: full names by header index, and RGBA floats by index. */
   names?: Record<number, string>;
   cclr?: Record<number, [number, number, number]>;
+  /** An `SCMJ` section, written last and packed the format's way (`appendModTag` writes it unpacked). */
+  mod?: ModTag;
 }
 
 const u32 = (n: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, true); return b; };
@@ -110,6 +113,10 @@ export function writeReplay(r: TestReplay): Uint8Array {
     }
     // A section from some other tool, which the reader must step over.
     parts.push(u32(0x74616253 /* "Sbat" */), u32(3), new Uint8Array([1, 2, 3]));
+  }
+  if (r.mod) {
+    const body = sized(new TextEncoder().encode(JSON.stringify(r.mod)), r.format);
+    parts.push(u32(0x4a4d4353 /* "SCMJ" */), u32(body.length), body);
   }
   return join(parts);
 }
