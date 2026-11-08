@@ -355,7 +355,13 @@ const QUEUEABLE = new Set([0x1a, 0x1e, 0x21, 0x22, 0x25, 0x26, 0x28, 0x2b, 0x2c,
 /** The order a Build command carries when it is really a Terran building landing. */
 const ORDER_LAND = 0x47;
 
-export function readCommands(d: Uint8Array): { commands: Command[]; unknown: number } {
+/**
+ * Reads a command section. `format` is the replay's: 1.16.1 never writes types 0x60–0x65 (Remastered added them in
+ * 1.21), so in a `"legacy"` replay they are a plugin's own commands, whose length is not knowable here, and they count
+ * as unknown like any other type the reader does not know. Without `format` they read as Remastered's.
+ */
+export function readCommands(d: Uint8Array, format?: ReplayFormat): { commands: Command[]; unknown: number } {
+  const legacy = format === "legacy";
   const commands: Command[] = [];
   let unknown = 0;
   const dv = new DataView(d.buffer, d.byteOffset, d.byteLength);
@@ -372,6 +378,8 @@ export function readCommands(d: Uint8Array): { commands: Command[]; unknown: num
       const player = u8();
       const type = u8();
       const at = { frame, player, type };
+      // A mod's plugin may send commands of its own under these ids in a 1.16.1 game (Cosmonarchy's sends 0x63).
+      if (legacy && type >= 0x60 && type <= 0x65) { unknown++; p = end; break; }
       try {
         switch (type) {
           case 0x14: case 0x60: { // right click (1.21 adds a word after the tag)
@@ -632,7 +640,7 @@ export async function parseReplay(bytes: Uint8Array, unzip: Inflate = inflate): 
   const id = await section(r, 4, format, unzip);
   if (format === "1.21") r.u32();
   const { header, slots } = readHeader(await section(r, 0x279, format, unzip), format);
-  const { commands, unknown } = readCommands(await sized(r, format, unzip));
+  const { commands, unknown } = readCommands(await sized(r, format, unzip), format);
   const chk = await sized(r, format, unzip);
   void id;
 
