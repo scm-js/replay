@@ -45,7 +45,12 @@ export interface ReplayPlayer {
   id: number;
   /** 1 computer, 2 human, … as the map's OWNR byte. */
   type: number;
-  /** 0 Zerg, 1 Terran, 2 Protoss. */
+  /**
+   * The race byte as the game stored it: 0 Zerg, 1 Terran, 2 Protoss; 3 to 7 the game's
+   * others (Independent, Neutral, User Select, Random, Inactive); any other value is a race a
+   * mod adds, which `ModTag.dataSet.races` may name. Kept as read, never folded to one of
+   * the three.
+   */
   race: number;
   team: number;
   name: string;
@@ -122,6 +127,21 @@ export interface ModFile {
 }
 
 /**
+ * A race a data set adds to the game's own, as a mod tag's `dataSet.races` lists them.
+ * The same shape as scmJS's editor and tools use; this package only carries it.
+ */
+export interface DataSetRace {
+  /** The race byte: 8 to 255. (0 to 7 are the game's.) */
+  id: number;
+  /** What it is called, 40 characters at most. */
+  name: string;
+  /** The lower-case letter its per-race files go by (`game\<letter>console.pcx`), when it has them. */
+  letter?: string;
+  /** The game's race it plays as: 0 Zerg, 1 Terran, 2 Protoss. Absent when not declared. */
+  like?: 0 | 1 | 2;
+}
+
+/**
  * What a replay's `SCMJ` section says about the mod a game was played with. Fields this
  * version does not know are kept as they were read.
  */
@@ -131,9 +151,10 @@ export interface ModTag {
   /**
    * The data set: the files that differ from the game's own. `hash` is 16 lowercase hex
    * digits, the first of the SHA-256 over the sorted `name\tsha256` lines of those files;
-   * `url` the makers' page, or null.
+   * `url` the makers' page, or null. `races`, when the data set declares them, names the
+   * races it adds to the game's own (`ReplayPlayer.race` values past 7).
    */
-  dataSet: { hash: string; name: string; url: string | null; [key: string]: unknown };
+  dataSet: { hash: string; name: string; url: string | null; races?: DataSetRace[]; [key: string]: unknown };
   /** The plugins that ran, in the order they were loaded; empty for none. */
   plugins: ModFile[];
   /** The FireGraft patch that was applied, if one was. */

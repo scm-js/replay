@@ -250,6 +250,16 @@ describe.each<ReplayFormat>(["legacy", "1.18", "1.21"])("a mod tag in a %s repla
     expect(await stripModTag(bytes)).toEqual(writeReplay({ format, players, commands: classic, chk: chk(64, 64, 4) }));
   });
 
+  it("reads and writes back a data set's races unchanged", async () => {
+    const withRaces: ModTag = { ...mod, dataSet: { ...mod.dataSet, races: [{ id: 69, name: "Askosi", letter: "a", like: 1 }, { id: 70, name: "Bloodsummon" }] } };
+    const bytes = await appendModTag(plain, withRaces);
+    const read = (await parseReplay(bytes)).mod!;
+    expect(read).toEqual(withRaces);
+    expect(read.dataSet.races).toEqual([{ id: 69, name: "Askosi", letter: "a", like: 1 }, { id: 70, name: "Bloodsummon" }]);
+    // Written again from what was read: the same bytes.
+    expect(await appendModTag(bytes, read)).toEqual(bytes);
+  });
+
   it("keeps fields it does not know", async () => {
     const later = { ...mod, v: 2, seed: 42, dataSet: { ...mod.dataSet, files: 37 } } as ModTag;
     expect((await parseReplay(await appendModTag(plain, later))).mod).toEqual(later);

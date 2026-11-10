@@ -42,7 +42,7 @@ translated.
 | --- | --- |
 | `format` | `"legacy"` (1.16 and before), `"1.18"` (Remastered 1.18 to 1.20) or `"1.21"` (Remastered 1.21 on) |
 | `header` | Engine, length in frames, start time, game title, map name and size, speed, game type, host |
-| `players` | Name (Remastered's full-length names where present), race, team, slot, the id commands carry, and colour as `#rrggbb` (Remastered's own colours where present) |
+| `players` | Name (Remastered's full-length names where present), race (0 Zerg, 1 Terran, 2 Protoss, 3 to 7 the game's others, any other value a mod's own), team, slot, the id commands carry, and colour as `#rrggbb` (Remastered's own colours where present) |
 | `commands` | Every command with its frame and player, by kind (`select`, `rightClick`, `targeted`, `build`, `train`, `morph`, `upgrade`, `tech`, `hotkey`, `chat`, `leave`, …) and the game's own type byte, with positions, units, orders and selected unit tags where the command has them |
 | `unknownCommands` | Commands whose type the reader does not know (the rest of their frame is skipped) |
 | `chk` | The map as a bare `scenario.chk` |
@@ -120,7 +120,7 @@ UTF-8 JSON, one object:
 | Field | |
 | --- | --- |
 | `v` | The format's version, `1` |
-| `dataSet` | `{ hash, name, url }`: the files the mod changes. `hash` is 16 lowercase hex digits: the first 16 of the SHA-256 over the changed files' `name<TAB>sha256` lines, sorted, joined by newlines. `url` is the makers' page, or `null` |
+| `dataSet` | `{ hash, name, url }`: the files the mod changes. `hash` is 16 lowercase hex digits: the first 16 of the SHA-256 over the changed files' `name<TAB>sha256` lines, sorted, joined by newlines. `url` is the makers' page, or `null`. It may also hold `races`, below |
 | `plugins` | `[{ name, sha256 }]`: the code that ran, in the order it was loaded; `[]` for none |
 | `firegraft` | `{ name, sha256 }` of the FireGraft patch applied, or `null` |
 | `noplugins` | `true` when the game was played without the mod's plugins |
@@ -129,6 +129,13 @@ UTF-8 JSON, one object:
 
 Every `sha256` is 64 lowercase hex digits. Fields a reader does not know are kept in what it
 returns, so a later version can add some.
+
+`dataSet.races`, when present, names the races the mod adds to the game's own:
+`[{ id, name, letter?, like? }]`, sorted by `id`. `id` is the race byte a player's record
+holds (8 to 255; 0 to 7 are the game's), `name` what the mod calls it, `letter` the
+lower-case letter its per-race files go by, and `like` the game's race it plays as (0 Zerg,
+1 Terran, 2 Protoss). A player whose `race` is past 7 and not listed has a race the tag does
+not name.
 
 ## Writing replays for tests
 
