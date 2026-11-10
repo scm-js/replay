@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `DataSetRace` and `ModTag.dataSet.races`: the races a mod adds to the game's own, by
+  their race byte, as a tag may name them. The tag kept the field before as one it did not
+  know; it is typed now.
+
+### Changed
+- `ReplayPlayer.race` is documented as it is read: 0 to 2 the game's three races, 3 to 7 its
+  others, and any other value a race a mod adds.
+
 ## [1.1.1] - 2026-11-08
 
 ### Fixed
